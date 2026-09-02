@@ -1,47 +1,25 @@
 #!/usr/bin/env python3
+"""
+Optimize a broadly neutralizing antibody by finding the antibody where the fittest
+escape mutant from a reference virus panel in the presence of the antibody is the least fit.
 
-# ------------------------------------------------------------------------------
-# Script Name: affinity_optimization_EvoEF.py
-# Description: This script optimizes an input broadly neutralizing HIV-1 antibody
-#              by finding a combination of mutations that minimizes the maximal
-#              fitness (R0) the virus can obtain. Given an input antibody, it makes
-#              all single point mutants at pre-selected residues, then computes antibody-virus
-#              binding affinities for a set of inputted viral mutants using EvoEF (Pearce et al. 2019).
-#              Together with virus-receptor binding affinities, it computes viral fitness for
-#              each antibody and selects the best antibody (with probability 1-epsilon)
-#              or a random antibody (with probability epsilon), then generates all single point mutants
-#              and iterates until convergence or a maximum number of iterations is reached.
-#
-# Outputs:
-# 1. Per-antibody binding affinities to all input viral mutants (one CSV per antibody in OUTPUT_DIR)
-# 2. CSVs containing a summary of each optimization per dose, criterion, and random seed, and an
-#    overall summary per dose and criterion (summarizing the outputs of each random seed)
-#
-# Author: Griffin Kutler Dodd
-#
-# Date Created: 2025-09-24
-# Last Modified: 2025-10-29
-#
-# Requirements:
-#   - This script is designed to be run using Python 3.13.5
-#
-# Usage:
-#   In CONFIG, change EVOEF_PATH to the full path to the EvoEF executable (https://github.com/tommyhuangthu/EvoEF)
-#   Change PDB_PATH to the full path to a .pdb of the virus-antibody structure
-#   Change VIRUS_VARIANTS_CSV to a CSV containing the receptor-binding affinities of the virus mutants to be analyzed
-#   Expected format of VIRUS_VARIANTS_CSV:
-#       first N columns are the N residues of the virus that are mutated
-#       column ddg_receptor that give the deltadeltaG of receptor binding of each variant relative to a reference
-#       column sequence (first N rows concatenated)
-#
-#   Change residues_virus to the residues on the virus that are mutated (format: tuple (chain, residue number, reference AA))
-#   Change residues_Ab to the residues on the antibody that can be optimized (format: tuple (chain, residue number, reference AA))
-#   Pick antibody doses (DOSES list, unit M), number of runs per dose (N_RUNS), and what criteri(a)(on) should be optimized (list CRITERIA, options max_r0 or delta_r0)
-#
-#   Temporary files will be stored in WORKDIR, and all output files will be stored in the folders OUTPUT_DIR and optimization_runs
-#
-# ------------------------------------------------------------------------------
+Output:
+- Per-antibody CSVs with binding affinities to all virus mutants
+- Optimization traces (iteration history per seed)
+- Summary statistics per dose and seed
 
+Usage:
+    python3 -m src.affinity_optimization.optimization
+Before running, update CONFIG with:
+    EVOEF_PATH: path to EvoEF executable
+    PDB_PATH: path to input PDB structure
+    residues_virus: list of (chain, residue_number, reference_AA) viral residues to mutate
+    chain_split: how to partition proteins into chains if there are more than two chains
+
+    And optionally:
+    OUTPUT_CSV: path to the output CSV file
+    mutant_residues_prot: list of (chain, residue_number, reference_AA, mutant_AA) to add to the protein
+"""
 
 import os
 import shutil
@@ -55,42 +33,33 @@ import pandas as pd
 import numpy as np
 import glob
 
+from src.utils import AA_ALPHABET
+from src.params import default_params
+
+
 # -----------------------
 # CONFIG
 # -----------------------
-EVOEF_PATH = "/home/griffin/Major_research_project/EvoEF/EvoEF"
-PDB_PATH = "/home/griffin/Major_research_project/Antibody_optimization/7UCF.pdb"
-WORKDIR = "evoef_workdir_sharedcache"
+EVOEF_PATH = "path/to/EvoEF/executable"
+PDB_PATH = "path/to/structure.pdb"
+WORKDIR = "evoef_workdir"
 CPU_TOTAL = cpu_count()
-CONCURRENT_BATCHES = CPU_TOTAL#min(28, CPU_TOTAL)
+CONCURRENT_BATCHES = min(28, CPU_TOTAL)
 PER_BATCH_THREADS = max(1, CPU_TOTAL // CONCURRENT_BATCHES)
-OUTPUT_DIR = "per_antibody_outputs_sharedcache"
+OUTPUT_DIR = "shared_cache"
 KEEP_BATCH_DIRS = False #set to True to keep per-batch directories
-VIRUS_VARIANTS_CSV = "predictions_subset_ddg_receptor_0.csv"
 VERBOSE = False
 
-DOSES = [2.8e-7, 2.8e-6]
-N_RUNS = 5
-CRITERIA = ["max_r0", "delta_r0"]
+VIRUS_VARIANTS_CSV = "predictions_subset_ddg_receptor_0.csv"
 
-#Parameters for computing R0
-MODEL_PARAMS = {
-    "lambda_T": 1e7,
-    "d": 0.2,
-    "beta_wt": 2e-9,
-    "gamma": 1.0,
-    "delta1": 0.5,
-    "delta2": 1.0,
-    "n": 1000.0,
-    "c": 20.0,
-    "RT": 0.616,
-    "KD_WT": 1e-8
-}
-
-#Stochasticity: decay epsilon (probability of random step) as epsilon0 * exp(-decay_rate * iteration)
+#Optimization parameters
+DOSES = [2.8e-6]
+N_RUNS = 25
 epsilon0 = 0.3
 decay_rate = 0.3
-MAX_ITER = 100
+MAX_ITER = 20
+
+MODEL_PARAMS = default_params()
 
 #Residues to vary in the virus (list of (chain, residue_number, reference_AA) tuples)
 residues_virus = [
@@ -124,21 +93,21 @@ residues_Ab = [
 #For example, if H is the heavy chain, L is the light chain, and V the virus, use HL,V
 chain_split = "G,HL"
 
-AA_ALPHABET = list("ACDEFGHIKLMNPQRSTVWY")
-
-# -----------------------
-# End CONFIG
-# -----------------------
-
 def pos_label(chain, resnum):
     return f"{chain}:{resnum}"
+
+def gibbs_multipliers(ddg, RT, h, K):
+    """Compute sigmoidal exp(-ddG / RT)."""
+    mult = 1.0/((1.0/(1.0+h))**K)
+    return mult * (1.0/(1.0 + h*np.exp(ddg / RT))) ** K
 
 def r0_fun(ddg_receptor, ddg_ab, Ab_dose, p):
     """Compute the R0 of a virus sequence based on its receptor-binding affinity (ddg_receptor), antibody-binding affinity
     (ddg_ab), dose of the antibody (Ab_dose), and other model parameters (p)"""
-    return (p['beta_wt']*np.exp(-ddg_receptor/p['RT'])*p['lambda_T']*p['gamma']*p['n'])/(p['c']*p['d']*(p['delta1']+p['gamma'])*(1+((Ab_dose/p['KD_WT'])*np.exp(-ddg_ab/p['RT']))))
+    ddg_receptor = gibbs_multipliers(ddg_receptor, p['RT'], p['h'], p['K'])
+    return (p['beta_wt']*ddg_receptor*p['lambda_T']*p['gamma']*p['n'])/(p['c']*p['d']*(p['delta1']+p['gamma'])*(1+((Ab_dose/p['KD_WT'])*np.exp(-ddg_ab/p['RT']))))
 
-def find_ddg_receptor_for_sequence(seq_str, virus_csv_path, residues_order):
+def find_ddg_receptor_for_sequence(seq_str, virus_csv_path):
     """Search input CSV for the ddg_receptor for a given virus sequence."""
     chunksize = 10000
     for chunk in pd.read_csv(virus_csv_path, usecols=lambda c: c in ('sequence', 'ddg_receptor'), chunksize=chunksize, dtype=str):
@@ -224,7 +193,7 @@ def build_mutants_in_batch(evoef_path, repaired_basename, batch_dir):
     return True
 
 def safe_remove(path):
-    """Safely remove all files in a directory. Used for cleaning EvoEF batch outputs."""
+    """Clean EvoEF batch outputs."""
     try:
         if os.path.isdir(path):
             shutil.rmtree(path)
@@ -417,7 +386,6 @@ def _format_dose_for_name(dose):
     s = s.replace(".", "p")
     return s
 
-
 def regenerate_overview_for_dose(ab_dose):
     """Scan OUTPUT_DIR for per-antibody CSVs and recreate a dose-specific overview.
     For each antibody, compute R0, then find max(R0) and delta(R0): R0 w/o Ab - R0 with Ab for the fittest virus sequence."""
@@ -437,7 +405,7 @@ def regenerate_overview_for_dose(ab_dose):
         ddg_ab_vals = []
         for _, row in df.iterrows():
             seq = ''.join(str(row[col]) for col in structure_labels)
-            ddg_rec = find_ddg_receptor_for_sequence(seq, VIRUS_VARIANTS_CSV, residues_virus)
+            ddg_rec = find_ddg_receptor_for_sequence(seq, VIRUS_VARIANTS_CSV)
             ddg_ab = float(row.get('ddg_ab'))
             r0_val = float(r0_fun(ddg_rec, ddg_ab, ab_dose, MODEL_PARAMS))
             r0_vals.append(r0_val)
@@ -452,19 +420,18 @@ def regenerate_overview_for_dose(ab_dose):
         best_seqs = ';'.join(seq_strings[i] for i in best_idx)
 
         #Compute delta R0 of the fittest sequence
-        ddg_rec_best = find_ddg_receptor_for_sequence(seq_strings[best_idx[0]], VIRUS_VARIANTS_CSV, residues_virus)
+        ddg_rec_best = find_ddg_receptor_for_sequence(seq_strings[best_idx[0]], VIRUS_VARIANTS_CSV)
         ddg_ab_best = r0_vals[best_idx[0]]
         r0_noab = r0_fun(ddg_rec_best, ddg_ab_best, 0.0, MODEL_PARAMS)
-        delta_r0 = float(r0_noab - maxr0)
-        overview_rows.append({'antibody_mutation': label, 'max_r0': float(max_r0), 'delta_r0': delta_r0, 'best_sequences': best_seqs})
+        overview_rows.append({'antibody_mutation': label, 'max_r0': float(max_r0), 'best_sequences': best_seqs})
 
     dose_tag = _format_dose_for_name(ab_dose)
     overview_path = os.path.join(OUTPUT_DIR, f'overview_per_antibody_dose_{dose_tag}.csv')
     with open(overview_path, 'w', newline='') as fh:
         writer = csv.writer(fh)
-        writer.writerow(['antibody_mutation', 'max_r0', 'delta_r0', 'best_sequences'])
+        writer.writerow(['antibody_mutation', 'max_r0', 'best_sequences'])
         for row in overview_rows:
-            writer.writerow([row['antibody_mutation'], row['max_r0'], row['delta_r0'], row['best_sequences']])
+            writer.writerow([row['antibody_mutation'], row['max_r0'], row['best_sequences']])
     return overview_path, pd.DataFrame(overview_rows)
 
 def load_overview_cache(overview_path):
@@ -500,13 +467,12 @@ def evaluate_antibody_sequences(seq_tuples, repaired_pdb, repaired_basename, vir
         batch_executor.shutdown(wait=True)
     return labels
 
-def select_fittest_label_from_overview(labels, overview_cache, criterion, rng):
-    """Select the best antibody  from a list of antibodies based on a given criterion (max_r0 or delta_r0)."""
-    metric_name = 'delta_r0' if criterion == 'delta_r0' else 'max_r0'
+def select_fittest_label_from_overview(labels, overview_cache, rng):
+    """Select the best antibody from a list of antibodies based on max_r0."""
     candidates = []
     for lab in labels:
         entry = overview_cache.get(lab)
-        val = float(entry.get(metric_name))
+        val = float(entry.get('max_r0'))
         candidates.append((lab, val))
     if not candidates:
         return rng.choice(labels)
@@ -579,104 +545,100 @@ def main():
 
     #Run across criteria, doses, and N_RUNS with independent RNGs
     base_ss = np.random.SeedSequence()
-    for criterion in CRITERIA:
-        for dose in DOSES:
-            dose_tag = _format_dose_for_name(dose)
-            overview_path, _ = regenerate_overview_for_dose(dose)
-            base_dir = os.path.join("optimization_runs", criterion, f"dose_{dose_tag}")
-            os.makedirs(base_dir, exist_ok=True)
-            summary_path = os.path.join(base_dir, "summary_all_seeds.csv")
-            if not os.path.exists(summary_path):
-                with open(summary_path, 'w', newline='') as fh:
+    for dose in DOSES:
+        dose_tag = _format_dose_for_name(dose)
+        overview_path, _ = regenerate_overview_for_dose(dose)
+        base_dir = os.path.join("optimization_runs", f"dose_{dose_tag}")
+        os.makedirs(base_dir, exist_ok=True)
+        summary_path = os.path.join(base_dir, "summary_all_seeds.csv")
+        if not os.path.exists(summary_path):
+            with open(summary_path, 'w', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["seed_index", "final_label", "final_metric", "iterations", "converged"])
+
+        for run_idx in range(N_RUNS):
+            child_ss = base_ss.spawn(1)[0]
+            rng = np.random.default_rng(child_ss)
+            run_dir = os.path.join(base_dir, f"seed_{run_idx}")
+            os.makedirs(run_dir, exist_ok=True)
+            report_path = os.path.join(run_dir, "optimization_trace.csv")
+            if not os.path.exists(report_path):
+                with open(report_path, 'w', newline='') as fh:
                     writer = csv.writer(fh)
-                    writer.writerow(["seed_index", "final_label", "final_metric", "iterations", "converged"])
+                    writer.writerow(['iteration', 'selected_ab_label', 'selected_ab_seq', 'max_r0', 'best_viral_sequences', 'selection_method', 'epsilon'])
 
-            for run_idx in range(N_RUNS):
-                child_ss = base_ss.spawn(1)[0]
-                rng = np.random.default_rng(child_ss)
-                run_dir = os.path.join(base_dir, f"seed_{run_idx}")
-                os.makedirs(run_dir, exist_ok=True)
-                report_path = os.path.join(run_dir, "optimization_trace.csv")
-                if not os.path.exists(report_path):
-                    with open(report_path, 'w', newline='') as fh:
-                        writer = csv.writer(fh)
-                        writer.writerow(['iteration', 'selected_ab_label', 'selected_ab_seq', 'max_r0', 'delta_r0', 'best_viral_sequences', 'selection_method', 'epsilon'])
+            current_label = wt_label
+            converged = False
+            iteration = 0
+            overview_cache = load_overview_cache(overview_path)
+            entry0 = overview_cache.get(current_label, {})
+            cur_max_r0 = entry0.get('max_r0', None)
+            cur_best_seqs = entry0.get('best_sequences', '')
+            with open(report_path, 'a', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow([iteration, current_label, ''.join(label_to_seq_tuple(current_label)), cur_max_r0, cur_best_seqs, 'init', epsilon0])
 
-                current_label = wt_label
-                converged = False
-                iteration = 1
+            #Optimization loop
+            while iteration < MAX_ITER:
+                iteration += 1
+                epsilon = float(epsilon0 * np.exp(-decay_rate * iteration))
+
+                cur_seq = label_to_seq_tuple(current_label)
+                neighbors = generate_neighbors(cur_seq)
+                candidates = [cur_seq] + neighbors
+                candidate_labels = [seq_tuple_to_label(s) for s in candidates]
+
+                #Ensure overview up to date and evaluate any missing candidate antibodies
                 overview_cache = load_overview_cache(overview_path)
-                entry0 = overview_cache.get(current_label, {})
-                cur_max_r0 = entry0.get('max_r0', None)
-                cur_delta_r0 = entry0.get('delta_r0', None)
-                cur_best_seqs = entry0.get('best_sequences', '')
+                missing_seqs = [s for s, lab in zip(candidates, candidate_labels) if lab not in overview_cache]
+                if missing_seqs:
+                    evaluate_antibody_sequences(missing_seqs, repaired_pdb, repaired_basename, virus_entries, wt_binding_val)
+                    overview_path, _ = regenerate_overview_for_dose(dose)
+                    overview_cache = load_overview_cache(overview_path)
+
+                #Choose best according to max(R0)
+                cand_vals = []
+                for lab in candidate_labels:
+                    ent = overview_cache.get(lab)
+                    if ent is None:
+                        continue
+                    cand_vals.append((lab, float(ent.get('max_r0')), ent))
+                if not cand_vals:
+                    break
+                min_val = min(v for (_, v, _) in cand_vals)
+                best_candidates = [lab for (lab, v, _) in cand_vals if v == min_val]
+
+                #Epsilon-greedy
+                if rng.random() < (1 - epsilon):
+                    idx = int(rng.integers(low=0, high=len(best_candidates)))
+                    selected_label = best_candidates[idx]
+                    method = 'greedy'
+                else:
+                    pool = [lab for lab in candidate_labels if lab != current_label]
+                    idx = int(rng.integers(low=0, high=len(pool))) if pool else 0
+                    selected_label = pool[idx] if pool else current_label
+                    method = 'random'
+
+                selected_entry = overview_cache.get(selected_label, {})
+                sel_max_r0 = selected_entry.get('max_r0', None)
+                sel_best_seqs = selected_entry.get('best_sequences', '')
+
                 with open(report_path, 'a', newline='') as fh:
                     writer = csv.writer(fh)
-                    writer.writerow([iteration, current_label, ''.join(label_to_seq_tuple(current_label)), cur_max_r0, cur_delta_r0, cur_best_seqs, 'init', epsilon0])
+                    writer.writerow([iteration, selected_label, ''.join(label_to_seq_tuple(selected_label)), sel_max_r0, sel_best_seqs, method, epsilon])
 
-                #Optimization loop
-                while iteration < MAX_ITER:
-                    iteration += 1
-                    epsilon = float(epsilon0 * np.exp(-decay_rate * (iteration - 1)))
+                #Convergence
+                if selected_label == current_label:
+                    converged = True
+                    break
+                current_label = selected_label
 
-                    cur_seq = label_to_seq_tuple(current_label)
-                    neighbors = generate_neighbors(cur_seq)
-                    candidates = [cur_seq] + neighbors
-                    candidate_labels = [seq_tuple_to_label(s) for s in candidates]
-
-                    #Ensure overview up to date and evaluate any missing candidate antibodies
-                    overview_cache = load_overview_cache(overview_path)
-                    missing_seqs = [s for s, lab in zip(candidates, candidate_labels) if lab not in overview_cache]
-                    if missing_seqs:
-                        evaluate_antibody_sequences(missing_seqs, repaired_pdb, repaired_basename, virus_entries, wt_binding_val)
-                        overview_path, _ = regenerate_overview_for_dose(dose)
-                        overview_cache = load_overview_cache(overview_path)
-
-                    #Choose best according to criterion
-                    cand_vals = []
-                    metric_key = 'delta_r0' if criterion == 'delta_r0' else 'max_r0'
-                    for lab in candidate_labels:
-                        ent = overview_cache.get(lab)
-                        if ent is None:
-                            continue
-                        cand_vals.append((lab, float(ent.get(metric_key)), ent))
-                    if not cand_vals:
-                        break
-                    min_val = min(v for (_, v, _) in cand_vals)
-                    best_candidates = [lab for (lab, v, _) in cand_vals if v == min_val]
-
-                    #Epsilon-greedy
-                    if rng.random() < (1 - epsilon):
-                        idx = int(rng.integers(low=0, high=len(best_candidates)))
-                        selected_label = best_candidates[idx]
-                        method = 'greedy'
-                    else:
-                        pool = [lab for lab in candidate_labels if lab != current_label]
-                        idx = int(rng.integers(low=0, high=len(pool))) if pool else 0
-                        selected_label = pool[idx] if pool else current_label
-                        method = 'random'
-
-                    selected_entry = overview_cache.get(selected_label, {})
-                    sel_max_r0 = selected_entry.get('max_r0', None)
-                    sel_delta_r0 = selected_entry.get('delta_r0', None)
-                    sel_best_seqs = selected_entry.get('best_sequences', '')
-
-                    with open(report_path, 'a', newline='') as fh:
-                        writer = csv.writer(fh)
-                        writer.writerow([iteration, selected_label, ''.join(label_to_seq_tuple(selected_label)), sel_max_r0, sel_delta_r0, sel_best_seqs, method, epsilon])
-
-                    #Convergence
-                    if selected_label == current_label:
-                        break
-                        converged = True
-                    current_label = selected_label
-
-                #Record to summary
-                final_entry = load_overview_cache(overview_path).get(current_label, {})
-                final_metric = final_entry.get(metric_key, None)
-                with open(summary_path, 'a', newline='') as fh:
-                    writer = csv.writer(fh)
-                    writer.writerow([run_idx, current_label, final_metric, iteration, converged])
+            #Record to summary
+            final_entry = load_overview_cache(overview_path).get(current_label, {})
+            final_metric = final_entry.get('max_r0', None)
+            with open(summary_path, 'a', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow([run_idx, current_label, final_metric, iteration, converged])
 
     print("All runs completed.")
 

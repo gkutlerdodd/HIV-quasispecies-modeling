@@ -1,33 +1,23 @@
 #!/usr/bin/env python3
 
-# ------------------------------------------------------------------------------
-# Script Name: affinity_prediction_EvoEF.py
-# Description: This script uses EvoEF (Pearce et al. 2019) to compute the binding affinities of viral mutants to another
-#              protein (either a host receptor or an antibody). All combinations of the selected viral residues will be mutated
-#              to generate all combinations of viral mutants (20^N), for which the free energy of binding will be predicted.
-#
-# Output: CSV file containing one column for each virus residue mutated and a column with binding energies (kJ/mol), with each row a different mutant
-#
-# Author: Griffin Kutler Dodd
-#
-# Date Created: 2025-09-24
-# Last Modified: 2025-10-29
-#
-# Requirements:
-#   - This script is designed to be run using Python 3.13.5
-#
-# Usage:
-#   In CONFIG, change EVOEF_PATH to the full path to the EvoEF executable (https://github.com/tommyhuangthu/EvoEF)
-#   Change PDB_PATH to the full path to a .pdb of the virus-protein structure
-#   Change residues_virus to the residues on the virus to be mutated (format: tuple (chain, residue number, reference AA))
-#   If analyzing binding to a mutant protein (e.g. a mutated antibody), add the mutated residues to mutant_residues_prot
-#
-#   Temporary files will be stored in WORKDIR, and a final CSV containing all 20^N viral sequences and predicted binding affinities
-#   Will be stored in OUTPUT_CSV.
-#
-# ------------------------------------------------------------------------------
+"""
+Predict the binding affinities of all 20^N viral mutants (N = number of mutant residues)
+to a given host protein (e.g., host receptor, antibody.) using EvoEF (Pearce et al. 2019).
 
+Usage:
+    python3 -m src.affinity_optimization.prediction
 
+Before running, update CONFIG with:
+    EVOEF_PATH: path to EvoEF executable
+    PDB_PATH: path to input PDB structure
+    residues_virus: list of (chain, residue_number, reference_AA) viral residues to mutate
+    chain_split: how to partition proteins into chains if there are more than two chains
+
+    And optionally:
+    OUTPUT_CSV: path to the output CSV file
+    mutant_residues_prot: list of (chain, residue_number, reference_AA, mutant_AA) to add to the protein
+
+"""
 import os
 import shutil
 import subprocess
@@ -38,18 +28,22 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
+from src.utils import AA_ALPHABET
+
 # -----------------------
 # CONFIG
 # -----------------------
-EVOEF_PATH = "/home/griffin/Major_research_project/EvoEF/EvoEF"
-PDB_PATH = "/home/griffin/Major_research_project/EvoEF_affinity_pipeline/7UCF.pdb"
+
+EVOEF_PATH = "path/to/EvoEF/executable"
+PDB_PATH = "path/to/structure.pdb"
 WORKDIR = "evoef_workdir"
+OUTPUT_CSV = "predictions.csv"
+
 CPU_TOTAL = cpu_count()
 CONCURRENT_BATCHES = CPU_TOTAL/2#min(28, CPU_TOTAL)
 PER_BATCH_THREADS = max(1, CPU_TOTAL // CONCURRENT_BATCHES)
 BATCH_SIZE = 100
 MAX_WORKERS = cpu_count()
-OUTPUT_CSV = "predictions_WT_Ab.csv"
 KEEP_BATCH_DIRS = False #set to True to keep per-batch directories
 VERBOSE = False
 
@@ -65,22 +59,11 @@ residues_virus = [
 
 #If analyzing binding to a mutated protein, specifiy the residues and what they should be mutated to
 #Format: list of (chain, residue_number, reference_AA, mutant_AA) tuples
-mutant_residues_prot = [
-    #("H", 106, "G", "M"),
-    #("H", 110, "F", "W"),
-    #("L", 96, "S", "K"),
-    #("L", 97, "R", "F"),
-]
+mutant_residues_prot = []
 
 #If there are more than two chains (e.g. antibody heavy and light chain and virus), specify how the chains should be split
 #For example, if H is the heavy chain, L is the light chain, and V the virus, use HL,V
 chain_split = "HL,G"
-
-AA_ALPHABET = list("ACDEFGHIKLMNPQRSTVWY")
-
-# -----------------------
-# End CONFIG
-# -----------------------
 
 def pos_label(chain, resnum):
     return f"{chain}:{resnum}"
@@ -89,11 +72,8 @@ def run_cmd(cmd, cwd=None):
     """Run a command, return (returncode, stdout, stderr)."""
     if VERBOSE:
         print(">>> Running: {} (cwd={})".format(" ".join(cmd), cwd))
-    proc = subprocess.run(cmd,
-                          cwd=cwd,
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE,
-                          universal_newlines=True)
+    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
     return proc.returncode, proc.stdout, proc.stderr
 
 def parse_total_from_evoef_stdout(text):
@@ -164,7 +144,7 @@ def build_mutants_in_batch(evoef_path, repaired_basename, batch_dir):
     return True
 
 def safe_remove(path):
-    """Safely remove all files in a directory. Used for cleaning EvoEF batch outputs."""
+    """Remove all files in a directory."""
     try:
         if os.path.isdir(path):
             shutil.rmtree(path)
@@ -213,11 +193,10 @@ def process_batch(batch_index, mutant_lines, mutant_tuples, repaired_pdb, repair
             for fut in as_completed(future_to_info):
                 (model_path, mutant_tuple) = future_to_info[fut]
                 try:
-                    val, stdout_text = fut.result()
+                    val, _ = fut.result()
                 except Exception as e:
                     print(f"[batch {batch_index}] ComputeBinding failed for {model_path}: {e}")
                     val = None
-                    stdout_text = ""
 
                 #Append CSV row
                 row = list(mutant_tuple) + [val if val is not None else ""]
@@ -236,12 +215,7 @@ def process_batch(batch_index, mutant_lines, mutant_tuples, repaired_pdb, repair
     #Clean batch directory
     if not KEEP_BATCH_DIRS:
         safe_remove(batch_dir)
-    else:
-        if VERBOSE:
-            print(f"[batch {batch_index}] Kept directory for debugging: {batch_dir}")
 
-    if VERBOSE:
-        print(f"[batch {batch_index}] Done - processed {processed} models")
     return processed
 
 def main():
@@ -274,27 +248,7 @@ def main():
         writer.writerow(header)
     print(f"CSV header written to {OUTPUT_CSV}")
 
-    #Generate all possible combinations of mutated residues
-    combo_iter = itertools.product(AA_ALPHABET, repeat=len(residues_order))
-
-    batch_index = 0
-    batch_mutant_lines = []
-    batch_mutant_tuples = []
-
-    #Helper to create mutant line
-    def make_line_and_store(combo):
-        line = make_mutant_line_from_refs(residues_order, combo)
-        return line
-
-    csv_lock = threading.Lock()
-
-    print(f"Starting pipeline: CPU_TOTAL={CPU_TOTAL}  CONCURRENT_BATCHES={CONCURRENT_BATCHES}  PER_BATCH_THREADS={PER_BATCH_THREADS}")
-    processed_total = 0
-    batch_executor = ThreadPoolExecutor(max_workers=CONCURRENT_BATCHES)
-    batch_futures = []
-
-    #Create mutant batches
-    #If mutating the protein (static across viruses), add these to the mutant strings
+    #Prepare protein string with mutations
     if mutant_residues_prot:
         prot_parts = []
         for (chain, resnum, ref_aa, mut_aa) in mutant_residues_prot:
@@ -303,8 +257,26 @@ def main():
     else:
         prot_string = None
 
-    for combo in combo_iter:
-        mutant_line = make_line_and_store(combo)
+    #Generate batches
+    batch_index = 0
+    batch_mutant_lines = []
+    batch_mutant_tuples = []
+    csv_lock = threading.Lock()
+    batch_executor = ThreadPoolExecutor(max_workers=CONCURRENT_BATCHES)
+    batch_futures = []
+
+    #Helper to create mutant line
+    def make_line_and_store(combo, prot_string):
+        line = make_mutant_line_from_refs(residues_order, combo, prot_string)
+        return line
+
+
+    print(f"Starting : CPU_TOTAL={CPU_TOTAL}  CONCURRENT_BATCHES={CONCURRENT_BATCHES}  PER_BATCH_THREADS={PER_BATCH_THREADS}")
+    processed_total = 0
+
+    #Create mutant batches
+    for combo in itertools.product(AA_ALPHABET, repeat=len(residues_order)):
+        mutant_line = make_line_and_store(combo, prot_string)
         if mutant_line is None:
             continue
         batch_mutant_lines.append(mutant_line)
@@ -354,7 +326,7 @@ def main():
 
     batch_executor.shutdown(wait=True)
     print("All batches complete. Total processed models:", processed_total)
-    print("Final CSV:", os.path.abspath(OUTPUT_CSV))
+    print("Output:", os.path.abspath(OUTPUT_CSV))
 
 if __name__ == "__main__":
     main()
